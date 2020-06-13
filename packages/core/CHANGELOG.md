@@ -1,5 +1,42 @@
 # xstate
 
+## 4.11.0
+
+### Minor Changes
+
+- [`2c75ab82`](https://github.com/davidkpiano/xstate/commit/2c75ab822e49cb1a23c1e14eb7bd04548ab143eb) [#1219](https://github.com/davidkpiano/xstate/pull/1219) Thanks [@davidkpiano](https://github.com/davidkpiano)! - The resolved value of the `invoke.data` property is now available in the "invoke meta" object, which is passed as the 3rd argument to the service creator in `options.services`. This will work for all types of invoked services now, including promises, observables, and callbacks.
+
+  ```js
+  const machine = createMachine({
+    initial: 'pending',
+    context: {
+      id: 42
+    },
+    states: {
+      pending: {
+        invoke: {
+          src: 'fetchUser',
+          data: {
+            userId: (context) => context.id
+          },
+          onDone: 'success'
+        }
+      },
+      success: {
+        type: 'final'
+      }
+    }
+  },
+  {
+    services: {
+      fetchUser: (ctx, _, { data }) => {
+        return fetch(`some/api/user/${data.userId}`)
+          .then(response => response.json());
+      }
+    }
+  }
+  ```
+
 ## 4.10.0
 
 ### Minor Changes

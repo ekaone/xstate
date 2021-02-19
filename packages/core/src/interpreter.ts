@@ -20,7 +20,6 @@ import {
   SingleOrArray,
   Subscribable,
   DoneEvent,
-  Unsubscribable,
   MachineOptions,
   ActionFunctionMap,
   SCXML,
@@ -28,7 +27,8 @@ import {
   Observer,
   Spawnable,
   Typestate,
-  AnyEventObject
+  AnyEventObject,
+  AnyInterpreter
 } from './types';
 import { State, bindActionToState, isState } from './State';
 import * as actionTypes from './actionTypes';
@@ -48,19 +48,30 @@ import {
   toEventObject,
   toSCXMLEvent,
   reportUnhandledExceptionOnInvocation,
-  symbolObservable
+  symbolObservable,
+  toInvokeSource,
+  toObserver,
+  isActor
 } from './utils';
 import { Scheduler } from './scheduler';
-import { Actor, isActor } from './Actor';
+import { Actor, isSpawnedActor, createDeferredActor } from './Actor';
 import { isInFinalState } from './stateUtils';
 import { registry } from './registry';
-import { registerService } from './devTools';
+import { getGlobal, registerService } from './devTools';
+import * as serviceScope from './serviceScope';
+import {
+  ActorRef,
+  ActorRefFrom,
+  SpawnedActorRef,
+  StopActionObject,
+  Subscription
+} from '.';
 
 export type StateListener<
   TContext,
   TEvent extends EventObject,
   TStateSchema extends StateSchema<TContext> = any,
-  TTypestate extends Typestate<TContext> = any
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
 > = (
   state: State<TContext, TEvent, TStateSchema, TTypestate>,
   event: TEvent
@@ -90,32 +101,7 @@ interface SpawnOptions {
 
 const DEFAULT_SPAWN_OPTIONS = { sync: false, autoForward: false };
 
-/**
- * Maintains a stack of the current service in scope.
- * This is used to provide the correct service to spawn().
- *
- * @private
- */
-const withServiceScope = (() => {
-  const serviceStack = [] as Array<Interpreter<any, any, any>>;
-
-  return <T, TService extends Interpreter<any, any, any>>(
-    service: TService | undefined,
-    fn: (service: TService) => T
-  ) => {
-    service && serviceStack.push(service);
-
-    const result = fn(
-      service || (serviceStack[serviceStack.length - 1] as TService)
-    );
-
-    service && serviceStack.pop();
-
-    return result;
-  };
-})();
-
-enum InterpreterStatus {
+export enum InterpreterStatus {
   NotStarted,
   Running,
   Stopped
@@ -126,7 +112,7 @@ export class Interpreter<
   TContext,
   TStateSchema extends StateSchema = any,
   TEvent extends EventObject = EventObject,
-  TTypestate extends Typestate<TContext> = any
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
 > implements Actor<State<TContext, TEvent, TStateSchema, TTypestate>, TEvent> {
   /**
    * The default interpreter options:
@@ -139,15 +125,15 @@ export class Interpreter<
     deferEvents: true,
     clock: {
       setTimeout: (fn, ms) => {
-        return global.setTimeout.call(null, fn, ms);
+        return setTimeout(fn, ms);
       },
       clearTimeout: (id) => {
-        return global.clearTimeout.call(null, id);
+        return clearTimeout(id);
       }
     },
     logger: global.console.log.bind(console),
     devTools: false
-  }))(typeof window === 'undefined' ? global : window);
+  }))(typeof self !== 'undefined' ? self : global);
   /**
    * The current state of the interpreted machine.
    */
@@ -174,7 +160,7 @@ export class Interpreter<
    * Whether the service is started.
    */
   public initialized = false;
-  private _status: InterpreterStatus = InterpreterStatus.NotStarted;
+  public status: InterpreterStatus = InterpreterStatus.NotStarted;
 
   // Actor
   public parent?: Interpreter<any>;
@@ -184,7 +170,7 @@ export class Interpreter<
    * The globally unique process ID for this invocation.
    */
   public sessionId: string;
-  public children: Map<string | number, Actor> = new Map();
+  public children: Map<string | number, SpawnedActorRef<any>> = new Map();
   private forwardTo: Set<string> = new Set();
 
   // Dev Tools
@@ -227,16 +213,15 @@ export class Interpreter<
       return this._initialState;
     }
 
-    return withServiceScope(this, () => {
+    return serviceScope.provide(this, () => {
       this._initialState = this.machine.initialState;
-
       return this._initialState;
     });
   }
   public get state(): State<TContext, TEvent, TStateSchema, TTypestate> {
     if (!IS_PRODUCTION) {
       warn(
-        this._status !== InterpreterStatus.NotStarted,
+        this.status !== InterpreterStatus.NotStarted,
         `Attempted to read state from uninitialized service '${this.id}'. Make sure the service is started first.`
       );
     }
@@ -258,6 +243,7 @@ export class Interpreter<
       this.exec(action, state, actionsConfig);
     }
   }
+
   private update(
     state: State<TContext, TEvent, TStateSchema, TTypestate>,
     _event: SCXML.Event<TEvent>
@@ -272,6 +258,11 @@ export class Interpreter<
     if (this.options.execute) {
       this.execute(this.state);
     }
+
+    // Update children
+    this.children.forEach((child) => {
+      this.state.children[child.id] = child;
+    });
 
     // Dev tools
     if (this.devTools) {
@@ -305,8 +296,8 @@ export class Interpreter<
       );
 
       const doneData =
-        finalChildStateNode && finalChildStateNode.data
-          ? mapContext(finalChildStateNode.data, state.context, _event)
+        finalChildStateNode && finalChildStateNode.doneData
+          ? mapContext(finalChildStateNode.doneData, state.context, _event)
           : undefined;
 
       for (const listener of this.doneListeners) {
@@ -327,7 +318,7 @@ export class Interpreter<
     this.listeners.add(listener);
 
     // Send current state to listener
-    if (this._status === InterpreterStatus.Running) {
+    if (this.status === InterpreterStatus.Running) {
       listener(this.state, this.state.event);
     }
 
@@ -335,21 +326,19 @@ export class Interpreter<
   }
   public subscribe(
     observer: Observer<State<TContext, TEvent, any, TTypestate>>
-  ): Unsubscribable;
+  ): Subscription;
   public subscribe(
     nextListener?: (state: State<TContext, TEvent, any, TTypestate>) => void,
-    // @ts-ignore
     errorListener?: (error: any) => void,
     completeListener?: () => void
-  ): Unsubscribable;
+  ): Subscription;
   public subscribe(
     nextListenerOrObserver?:
       | ((state: State<TContext, TEvent, any, TTypestate>) => void)
       | Observer<State<TContext, TEvent, any, TTypestate>>,
-    // @ts-ignore
-    errorListener?: (error: any) => void,
+    _?: (error: any) => void, // TODO: error listener
     completeListener?: () => void
-  ): Unsubscribable {
+  ): Subscription {
     if (!nextListenerOrObserver) {
       return { unsubscribe: () => void 0 };
     }
@@ -369,7 +358,7 @@ export class Interpreter<
     this.listeners.add(listener);
 
     // Send current state to listener
-    if (this._status === InterpreterStatus.Running) {
+    if (this.status === InterpreterStatus.Running) {
       listener(this.state);
     }
 
@@ -392,7 +381,7 @@ export class Interpreter<
    */
   public onEvent(
     listener: EventListener
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.eventListeners.add(listener);
     return this;
   }
@@ -402,7 +391,7 @@ export class Interpreter<
    */
   public onSend(
     listener: EventListener
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.sendListeners.add(listener);
     return this;
   }
@@ -412,7 +401,7 @@ export class Interpreter<
    */
   public onChange(
     listener: ContextListener<TContext>
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.contextListeners.add(listener);
     return this;
   }
@@ -422,7 +411,7 @@ export class Interpreter<
    */
   public onStop(
     listener: Listener
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.stopListeners.add(listener);
     return this;
   }
@@ -432,7 +421,7 @@ export class Interpreter<
    */
   public onDone(
     listener: EventListener<DoneEvent>
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.doneListeners.add(listener);
     return this;
   }
@@ -442,7 +431,7 @@ export class Interpreter<
    */
   public off(
     listener: (...args: any[]) => void
-  ): Interpreter<TContext, TStateSchema, TEvent> {
+  ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     this.listeners.delete(listener);
     this.eventListeners.delete(listener);
     this.sendListeners.delete(listener);
@@ -464,19 +453,19 @@ export class Interpreter<
       | State<TContext, TEvent, TStateSchema, TTypestate>
       | StateValue
   ): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
-    if (this._status === InterpreterStatus.Running) {
+    if (this.status === InterpreterStatus.Running) {
       // Do not restart the service if it is already started
       return this;
     }
 
     registry.register(this.sessionId, this as Actor);
     this.initialized = true;
-    this._status = InterpreterStatus.Running;
+    this.status = InterpreterStatus.Running;
 
     const resolvedState =
       initialState === undefined
         ? this.initialState
-        : withServiceScope(this, () => {
+        : serviceScope.provide(this, () => {
             return isState<TContext, TEvent, TStateSchema, TTypestate>(
               initialState
             )
@@ -499,7 +488,7 @@ export class Interpreter<
    *
    * This will also notify the `onStop` listeners.
    */
-  public stop(): Interpreter<TContext, TStateSchema, TEvent> {
+  public stop(): Interpreter<TContext, TStateSchema, TEvent, TTypestate> {
     for (const listener of this.listeners) {
       this.listeners.delete(listener);
     }
@@ -515,6 +504,17 @@ export class Interpreter<
       this.doneListeners.delete(listener);
     }
 
+    if (!this.initialized) {
+      // Interpreter already stopped; do nothing
+      return this;
+    }
+
+    this.state.configuration.forEach((stateNode) => {
+      for (const action of stateNode.definition.exit) {
+        this.exec(action, this.state);
+      }
+    });
+
     // Stop all children
     this.children.forEach((child) => {
       if (isFunction(child.stop)) {
@@ -529,7 +529,7 @@ export class Interpreter<
 
     this.scheduler.clear();
     this.initialized = false;
-    this._status = InterpreterStatus.Stopped;
+    this.status = InterpreterStatus.Stopped;
     registry.free(this.sessionId);
 
     return this;
@@ -554,7 +554,7 @@ export class Interpreter<
 
     const _event = toSCXMLEvent(toEventObject(event as Event<TEvent>, payload));
 
-    if (this._status === InterpreterStatus.Stopped) {
+    if (this.status === InterpreterStatus.Stopped) {
       // do nothing
       if (!IS_PRODUCTION) {
         warn(
@@ -570,21 +570,9 @@ export class Interpreter<
     }
 
     if (
-      this._status === InterpreterStatus.NotStarted &&
-      this.options.deferEvents
+      this.status !== InterpreterStatus.Running &&
+      !this.options.deferEvents
     ) {
-      // tslint:disable-next-line:no-console
-      if (!IS_PRODUCTION) {
-        warn(
-          false,
-          `Event "${_event.name}" was sent to uninitialized service "${
-            this.machine.id
-          }" and is deferred. Make sure .start() is called for this service.\nEvent: ${JSON.stringify(
-            _event.data
-          )}`
-        );
-      }
-    } else if (this._status !== InterpreterStatus.Running) {
       throw new Error(
         `Event "${_event.name}" was sent to uninitialized service "${
           this.machine.id
@@ -610,7 +598,7 @@ export class Interpreter<
 
   private batch(events: Array<TEvent | TEvent['type']>): void {
     if (
-      this._status === InterpreterStatus.NotStarted &&
+      this.status === InterpreterStatus.NotStarted &&
       this.options.deferEvents
     ) {
       // tslint:disable-next-line:no-console
@@ -624,7 +612,7 @@ export class Interpreter<
           )}`
         );
       }
-    } else if (this._status !== InterpreterStatus.Running) {
+    } else if (this.status !== InterpreterStatus.Running) {
       throw new Error(
         // tslint:disable-next-line:max-line-length
         `${events.length} event(s) were sent to uninitialized service "${this.machine.id}". Make sure .start() is called for this service, or set { deferEvents: true } in the service options.`
@@ -640,7 +628,7 @@ export class Interpreter<
 
         this.forward(_event);
 
-        nextState = withServiceScope(this, () => {
+        nextState = serviceScope.provide(this, () => {
           return this.machine.transition(nextState, _event);
         });
 
@@ -672,15 +660,17 @@ export class Interpreter<
 
   private sendTo = (
     event: SCXML.Event<AnyEventObject>,
-    to: string | number | Actor
+    to: string | number | ActorRef<any>
   ) => {
     const isParent =
       this.parent && (to === SpecialTargets.Parent || this.parent.id === to);
     const target = isParent
       ? this.parent
+      : isString(to)
+      ? this.children.get(to as string) || registry.get(to as string)
       : isActor(to)
       ? to
-      : this.children.get(to) || registry.get(to as string);
+      : undefined;
 
     if (!target) {
       if (!isParent) {
@@ -701,7 +691,7 @@ export class Interpreter<
 
     if ('machine' in target) {
       // Send SCXML events to machines
-      (target as Interpreter<any, any, any>).send({
+      (target as AnyInterpreter).send({
         ...event,
         name:
           event.name === actionTypes.error ? `${error(this.id)}` : event.name,
@@ -733,7 +723,7 @@ export class Interpreter<
       throw (_event.data as any).data;
     }
 
-    const nextState = withServiceScope(this, () => {
+    const nextState = serviceScope.provide(this, () => {
       return this.machine.transition(this.state, _event);
     });
 
@@ -836,9 +826,11 @@ export class Interpreter<
 
         // Invoked services
         if (activity.type === ActionTypes.Invoke) {
-          const serviceCreator: ServiceConfig<TContext> | undefined = this
-            .machine.options.services
-            ? this.machine.options.services[activity.src]
+          const invokeSource = toInvokeSource(activity.src);
+          const serviceCreator:
+            | ServiceConfig<TContext, TEvent>
+            | undefined = this.machine.options.services
+            ? this.machine.options.services[invokeSource.type]
             : undefined;
 
           const { id, data } = activity;
@@ -873,21 +865,21 @@ export class Interpreter<
             : undefined;
 
           const source = isFunction(serviceCreator)
-            ? serviceCreator(context, _event.data, { data: resolvedData })
+            ? serviceCreator(context, _event.data, {
+                data: resolvedData,
+                src: invokeSource
+              })
             : serviceCreator;
 
           if (isPromiseLike(source)) {
-            this.state.children[id] = this.spawnPromise(
-              Promise.resolve(source),
-              id
-            );
+            this.spawnPromise(Promise.resolve(source), id);
           } else if (isFunction(source)) {
-            this.state.children[id] = this.spawnCallback(source, id);
+            this.spawnCallback(source, id);
           } else if (isObservable<TEvent>(source)) {
-            this.state.children[id] = this.spawnObservable(source, id);
+            this.spawnObservable(source, id);
           } else if (isMachine(source)) {
             // TODO: try/catch here
-            this.state.children[id] = this.spawnMachine(
+            this.spawnMachine(
               resolvedData ? source.withContext(resolvedData) : source,
               {
                 id,
@@ -904,7 +896,7 @@ export class Interpreter<
         break;
       }
       case actionTypes.stop: {
-        this.stopChild(action.activity.id);
+        this.stopChild((action as StopActionObject).activity.id);
         break;
       }
 
@@ -929,6 +921,7 @@ export class Interpreter<
 
     return undefined;
   }
+
   private removeChild(childId: string): void {
     this.children.delete(childId);
     this.forwardTo.delete(childId);
@@ -948,12 +941,16 @@ export class Interpreter<
       child.stop();
     }
   }
-  public spawn(entity: Spawnable, name: string, options?: SpawnOptions): Actor {
+  public spawn(
+    entity: Spawnable,
+    name: string,
+    options?: SpawnOptions
+  ): SpawnedActorRef<any> {
     if (isPromiseLike(entity)) {
       return this.spawnPromise(Promise.resolve(entity), name);
     } else if (isFunction(entity)) {
       return this.spawnCallback(entity as InvokeCallback, name);
-    } else if (isActor(entity)) {
+    } else if (isSpawnedActor(entity)) {
       return this.spawnActor(entity);
     } else if (isObservable<TEvent>(entity)) {
       return this.spawnObservable(entity, name);
@@ -972,7 +969,7 @@ export class Interpreter<
   >(
     machine: StateMachine<TChildContext, TChildStateSchema, TChildEvent>,
     options: { id?: string; autoForward?: boolean; sync?: boolean } = {}
-  ): Interpreter<TChildContext, TChildStateSchema, TChildEvent> {
+  ): SpawnedActorRef<TChildEvent, State<TChildContext, TChildEvent>> {
     const childService = new Interpreter(machine, {
       ...this.options, // inherit options from this interpreter
       parent: this,
@@ -995,10 +992,7 @@ export class Interpreter<
 
     const actor = childService;
 
-    this.children.set(
-      childService.id,
-      actor as Actor<State<TChildContext, TChildEvent>, TChildEvent>
-    );
+    this.children.set(childService.id, actor);
 
     if (resolvedOptions.autoForward) {
       this.forwardTo.add(childService.id);
@@ -1013,7 +1007,10 @@ export class Interpreter<
 
     return actor;
   }
-  private spawnPromise<T>(promise: Promise<T>, id: string): Actor<T, never> {
+  private spawnPromise<T>(
+    promise: Promise<T>,
+    id: string
+  ): SpawnedActorRef<never, T> {
     let canceled = false;
 
     promise.then(
@@ -1049,27 +1046,29 @@ export class Interpreter<
       }
     );
 
-    const actor = {
+    const actor: SpawnedActorRef<never, T> = {
       id,
       send: () => void 0,
-      subscribe: (next, handleError, complete) => {
+      subscribe: (next, handleError?, complete?) => {
+        const observer = toObserver(next, handleError, complete);
+
         let unsubscribed = false;
         promise.then(
           (response) => {
             if (unsubscribed) {
               return;
             }
-            next && next(response);
+            observer.next(response);
             if (unsubscribed) {
               return;
             }
-            complete && complete();
+            observer.complete();
           },
           (err) => {
             if (unsubscribed) {
               return;
             }
-            handleError(err);
+            observer.error(err);
           }
         );
 
@@ -1089,7 +1088,10 @@ export class Interpreter<
 
     return actor;
   }
-  private spawnCallback(callback: InvokeCallback, id: string): Actor {
+  private spawnCallback(
+    callback: InvokeCallback,
+    id: string
+  ): SpawnedActorRef<any> {
     let canceled = false;
     const receivers = new Set<(e: EventObject) => void>();
     const listeners = new Set<(e: EventObject) => void>();
@@ -1099,7 +1101,7 @@ export class Interpreter<
       if (canceled) {
         return;
       }
-      this.send(e);
+      this.send(toSCXMLEvent(e, { origin: id }));
     };
 
     let callbackStop;
@@ -1148,7 +1150,7 @@ export class Interpreter<
   private spawnObservable<T extends TEvent>(
     source: Subscribable<T>,
     id: string
-  ): Actor {
+  ): SpawnedActorRef<any, T> {
     const subscription = source.subscribe(
       (value) => {
         this.send(toSCXMLEvent(value, { origin: id }));
@@ -1163,10 +1165,10 @@ export class Interpreter<
       }
     );
 
-    const actor = {
+    const actor: SpawnedActorRef<any, T> = {
       id,
       send: () => void 0,
-      subscribe: (next, handleError, complete) => {
+      subscribe: (next, handleError?, complete?) => {
         return source.subscribe(next, handleError, complete);
       },
       stop: () => subscription.unsubscribe(),
@@ -1179,7 +1181,7 @@ export class Interpreter<
 
     return actor;
   }
-  private spawnActor<T extends Actor>(actor: T): T {
+  private spawnActor<T extends SpawnedActorRef<any>>(actor: T): T {
     this.children.set(actor.id, actor);
 
     return actor;
@@ -1220,13 +1222,14 @@ export class Interpreter<
   }
 
   private attachDev(): void {
-    if (this.options.devTools && typeof window !== 'undefined') {
-      if ((window as any).__REDUX_DEVTOOLS_EXTENSION__) {
+    const global = getGlobal();
+    if (this.options.devTools && global) {
+      if ((global as any).__REDUX_DEVTOOLS_EXTENSION__) {
         const devToolsOptions =
           typeof this.options.devTools === 'object'
             ? this.options.devTools
             : undefined;
-        this.devTools = (window as any).__REDUX_DEVTOOLS_EXTENSION__.connect(
+        this.devTools = (global as any).__REDUX_DEVTOOLS_EXTENSION__.connect(
           {
             name: this.id,
             autoPause: true,
@@ -1266,16 +1269,6 @@ export class Interpreter<
   }
 }
 
-const createNullActor = (name: string = 'null'): Actor => ({
-  id: name,
-  send: () => void 0,
-  subscribe: () => {
-    // tslint:disable-next-line:no-empty
-    return { unsubscribe: () => {} };
-  },
-  toJSON: () => ({ id: name })
-});
-
 const resolveSpawnOptions = (nameOrOptions?: string | SpawnOptions) => {
   if (isString(nameOrOptions)) {
     return { ...DEFAULT_SPAWN_OPTIONS, name: nameOrOptions };
@@ -1291,31 +1284,31 @@ const resolveSpawnOptions = (nameOrOptions?: string | SpawnOptions) => {
 export function spawn<TC, TE extends EventObject>(
   entity: StateMachine<TC, any, TE>,
   nameOrOptions?: string | SpawnOptions
-): Interpreter<TC, any, TE>;
+): ActorRefFrom<StateMachine<TC, any, TE>>;
 export function spawn(
   entity: Spawnable,
   nameOrOptions?: string | SpawnOptions
-): Actor;
+): SpawnedActorRef<any>;
 export function spawn(
   entity: Spawnable,
   nameOrOptions?: string | SpawnOptions
-): Actor {
+): SpawnedActorRef<any> {
   const resolvedOptions = resolveSpawnOptions(nameOrOptions);
 
-  return withServiceScope(undefined, (service) => {
+  return serviceScope.consume((service) => {
     if (!IS_PRODUCTION) {
+      const isLazyEntity = isMachine(entity) || isFunction(entity);
       warn(
-        !!service,
+        !!service || isLazyEntity,
         `Attempted to spawn an Actor (ID: "${
           isMachine(entity) ? entity.id : 'undefined'
         }") outside of a service. This will have no effect.`
       );
     }
-
     if (service) {
       return service.spawn(entity, resolvedOptions.name, resolvedOptions);
     } else {
-      return createNullActor(resolvedOptions.name);
+      return createDeferredActor(entity, resolvedOptions.name);
     }
   });
 }
@@ -1330,7 +1323,7 @@ export function interpret<
   TContext = DefaultContext,
   TStateSchema extends StateSchema = any,
   TEvent extends EventObject = EventObject,
-  TTypestate extends Typestate<TContext> = any
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
 >(
   machine: StateMachine<TContext, TStateSchema, TEvent, TTypestate>,
   options?: Partial<InterpreterOptions>

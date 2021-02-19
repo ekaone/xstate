@@ -55,8 +55,6 @@ function actionToSCXML(action: ActionObject<any, any>): XMLElement {
 export function transitionToSCXML(
   transition: TransitionDefinition<any, any>
 ): XMLElement {
-  // console.log(transition.cond!.predicate);
-
   const elements = transition.actions.map(actionToSCXML);
 
   return {
@@ -135,8 +133,8 @@ function stateNodeToSCXML(stateNode: StateNode<any, any, any>): XMLElement {
   elements.push(...transitionElements);
   elements.push(...childStates);
 
-  if (stateNode.type === 'final' && stateNode.data) {
-    elements.push(doneDataToSCXML(stateNode.data));
+  if (stateNode.type === 'final' && stateNode.doneData) {
+    elements.push(doneDataToSCXML(stateNode.doneData));
   }
 
   return {

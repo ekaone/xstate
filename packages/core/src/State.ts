@@ -10,14 +10,14 @@ import {
   SCXML,
   StateSchema,
   TransitionDefinition,
-  Typestate
+  Typestate,
+  ActorRef
 } from './types';
 import { EMPTY_ACTIVITY_MAP } from './constants';
 import { matchesState, keys, isString } from './utils';
 import { StateNode } from './StateNode';
 import { nextEvents } from './stateUtils';
 import { initEvent } from './actions';
-import { Actor } from './Actor';
 
 export function stateValuesEqual(
   a: StateValue | undefined,
@@ -48,7 +48,7 @@ export function isState<
   TContext,
   TEvent extends EventObject,
   TStateSchema extends StateSchema<TContext> = any,
-  TTypestate extends Typestate<TContext> = any
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
 >(
   state: object | string
 ): state is State<TContext, TEvent, TStateSchema, TTypestate> {
@@ -61,7 +61,7 @@ export function isState<
 
 export function bindActionToState<TC, TE extends EventObject>(
   action: ActionObject<TC, TE>,
-  state: State<TC, TE>
+  state: State<TC, TE, any, any>
 ): ActionObject<TC, TE> {
   const { exec } = action;
   const boundAction: ActionObject<TC, TE> = {
@@ -89,7 +89,7 @@ export class State<
   public value: StateValue;
   public context: TContext;
   public historyValue?: HistoryValue | undefined;
-  public history?: State<TContext, TEvent, TStateSchema>;
+  public history?: State<TContext, TEvent, TStateSchema, TTypestate>;
   public actions: Array<ActionObject<TContext, TEvent>> = [];
   public activities: ActivityMap = EMPTY_ACTIVITY_MAP;
   public meta: any = {};
@@ -113,7 +113,7 @@ export class State<
   /**
    * The enabled state nodes representative of the state value.
    */
-  public configuration: Array<StateNode<TContext, any, TEvent>>;
+  public configuration: Array<StateNode<TContext, any, TEvent, any>>;
   /**
    * The next events that will cause a transition from the current state.
    */
@@ -126,16 +126,16 @@ export class State<
   /**
    * An object mapping actor IDs to spawned actors/invoked services.
    */
-  public children: Record<string, Actor>;
+  public children: Record<string, ActorRef<any>>;
   /**
    * Creates a new State instance for the given `stateValue` and `context`.
    * @param stateValue
    * @param context
    */
   public static from<TC, TE extends EventObject = EventObject>(
-    stateValue: State<TC, TE> | StateValue,
+    stateValue: State<TC, TE, any, any> | StateValue,
     context?: TC | undefined
-  ): State<TC, TE> {
+  ): State<TC, TE, any, any> {
     if (stateValue instanceof State) {
       if (stateValue.context !== context) {
         return new State<TC, TE>({
@@ -236,7 +236,7 @@ export class State<
     this._sessionid = config._sessionid;
     this.event = this._event.data;
     this.historyValue = config.historyValue;
-    this.history = config.history;
+    this.history = config.history as this;
     this.actions = config.actions || [];
     this.activities = config.activities || EMPTY_ACTIVITY_MAP;
     this.meta = config.meta || {};
@@ -291,7 +291,11 @@ export class State<
   public matches<TSV extends TTypestate['value']>(
     parentStateValue: TSV
   ): this is State<
-    (TTypestate extends { value: TSV } ? TTypestate : never)['context'],
+    (TTypestate extends any
+      ? { value: TSV; context: any } extends TTypestate
+        ? TTypestate
+        : never
+      : never)['context'],
     TEvent,
     TStateSchema,
     TTypestate

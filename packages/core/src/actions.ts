@@ -33,7 +33,8 @@ import {
   ExprWithMeta,
   ChooseConditon,
   ChooseAction,
-  AnyEventObject
+  AnyEventObject,
+  Expr
 } from './types';
 import * as actionTypes from './actionTypes';
 import {
@@ -48,12 +49,13 @@ import {
   warn,
   toGuard,
   evaluateGuard,
-  toArray
+  toArray,
+  isArray
 } from './utils';
-import { isArray } from './utils';
 import { State } from './State';
 import { StateNode } from './StateNode';
 import { IS_PRODUCTION } from './environment';
+import { StopAction, StopActionObject } from '.';
 
 export { actionTypes };
 
@@ -103,12 +105,12 @@ export function toActionObject<TContext, TEvent extends EventObject>(
         exec
       };
     } else if (exec) {
-      const { type, ...other } = action;
+      const actionType = exec.type || action.type;
 
       actionObject = {
-        type,
         ...exec,
-        ...other
+        ...action,
+        type: actionType
       } as ActionObject<TContext, TEvent>;
     } else {
       actionObject = action as ActionObject<TContext, TEvent>;
@@ -159,7 +161,7 @@ export function toActivityDefinition<TContext, TEvent extends EventObject>(
  */
 export function raise<TContext, TEvent extends EventObject>(
   event: Event<TEvent>
-): RaiseAction<TEvent> | SendAction<TContext, TEvent, TEvent> {
+): RaiseAction<TEvent> | SendAction<TContext, AnyEventObject, TEvent> {
   if (!isString(event)) {
     return send(event, { to: SpecialTargets.Internal });
   }
@@ -386,18 +388,44 @@ export function start<TContext, TEvent extends EventObject>(
 /**
  * Stops an activity.
  *
- * @param activity The activity to stop.
+ * @param actorRef The activity to stop.
  */
 export function stop<TContext, TEvent extends EventObject>(
-  activity: string | ActivityDefinition<TContext, TEvent>
-): ActivityActionObject<TContext, TEvent> {
-  const activityDef = toActivityDefinition(activity);
+  actorRef:
+    | string
+    | ActivityDefinition<TContext, TEvent>
+    | Expr<TContext, TEvent, string | { id: string }>
+): StopAction<TContext, TEvent> {
+  const activity = isFunction(actorRef)
+    ? actorRef
+    : toActivityDefinition(actorRef);
 
   return {
     type: ActionTypes.Stop,
-    activity: activityDef,
+    activity,
     exec: undefined
   };
+}
+
+export function resolveStop<TContext, TEvent extends EventObject>(
+  action: StopAction<TContext, TEvent>,
+  context: TContext,
+  _event: SCXML.Event<TEvent>
+): StopActionObject {
+  const actorRefOrString = isFunction(action.activity)
+    ? action.activity(context, _event.data)
+    : action.activity;
+  const resolvedActorRef =
+    typeof actorRefOrString === 'string'
+      ? { id: actorRefOrString }
+      : actorRefOrString;
+
+  const actionObject = {
+    type: ActionTypes.Stop as const,
+    activity: resolvedActorRef
+  };
+
+  return actionObject;
 }
 
 /**
@@ -550,7 +578,7 @@ export function choose<TContext, TEvent extends EventObject>(
 }
 
 export function resolveActions<TContext, TEvent extends EventObject>(
-  machine: StateNode<TContext, any, TEvent>,
+  machine: StateNode<TContext, any, TEvent, any>,
   currentState: State<TContext, TEvent> | undefined,
   currentContext: TContext,
   _event: SCXML.Event<TEvent>,
@@ -643,6 +671,13 @@ export function resolveActions<TContext, TEvent extends EventObject>(
           );
           updatedContext = resolved[1];
           return resolved[0];
+        }
+        case actionTypes.stop: {
+          return resolveStop(
+            actionObject as StopAction<TContext, TEvent>,
+            updatedContext,
+            _event
+          );
         }
         default:
           return toActionObject(actionObject, machine.options.actions);

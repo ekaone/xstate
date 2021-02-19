@@ -256,6 +256,10 @@ Every transition above is external and will have its `exit` and `entry` actions 
 
 ## Transient Transitions
 
+::: warning
+The empty string syntax (`{ on: { '': ... } }`) will be deprecated in version 5. The new `always` syntax in version 4.11+ should be preferred. See below section on [eventless transitions](#eventless-always-transitions), which are the same as transient transitions.
+:::
+
 A transient transition is a transition that is enabled by a [null event](./events.md#null-events). In other words, it is a transition that is _immediately_ taken (i.e., without a triggering event) as long as any conditions are met:
 
 ```js {14-17}
@@ -320,6 +324,94 @@ gameService.send('AWARD_POINTS');
 Just like transitions, transient transitions can be specified as a single transition (e.g., `'': 'someTarget'`), or an array of conditional transitions. If no conditional transitions on a transient transition are met, the machine stays in the same state.
 
 Null events are always "sent" for every transition, internal or external.
+
+## Eventless ("Always") Transitions <Badge text="4.11+" />
+
+An eventless transition is a transition that is **always taken** when the machine is in the state where it is defined, and when its `cond` guard evaluates to `true`. They are checked:
+
+- immediately when the state node is entered
+- every time the machine receives an actionable event (regardless of whether the event triggers internal or external transition)
+
+Eventless transitions are defined on the `always` property of the state node:
+
+```js {13-16}
+const gameMachine = Machine(
+  {
+    id: 'game',
+    initial: 'playing',
+    context: {
+      points: 0
+    },
+    states: {
+      playing: {
+        // Eventless transition
+        // Will transition to either 'win' or 'lose' immediately upon
+        // entering 'playing' state or receiving AWARD_POINTS event
+        // if the condition is met.
+        always: [
+          { target: 'win', cond: 'didPlayerWin' },
+          { target: 'lose', cond: 'didPlayerLose' }
+        ],
+        on: {
+          // Self-transition
+          AWARD_POINTS: {
+            actions: assign({
+              points: 100
+            })
+          }
+        }
+      },
+      win: { type: 'final' },
+      lose: { type: 'final' }
+    }
+  },
+  {
+    guards: {
+      didPlayerWin: (context, event) => {
+        // check if player won
+        return context.points > 99;
+      },
+      didPlayerLose: (context, event) => {
+        // check if player lost
+        return context.points < 0;
+      }
+    }
+  }
+);
+
+const gameService = interpret(gameMachine)
+  .onTransition((state) => console.log(state.value))
+  .start();
+
+// Still in 'playing' state because no conditions of
+// transient transition were met
+// => 'playing'
+
+// When 'AWARD_POINTS' is sent, a self-transition to 'PLAYING' occurs.
+// The transient transition to 'win' is taken because the 'didPlayerWin'
+// condition is satisfied.
+gameService.send('AWARD_POINTS');
+// => 'win'
+```
+
+### Eventless vs. wildcard transitions
+
+- [Wildcard transitions](#wildcard-descriptors) are not checked on entering state nodes. Eventless transitions are. Guards for eventless transitions are evaluated before doing anything else (even before evaluating guards of entry actions).
+- Re-evaluation of eventless transitions is triggered by any actionable event. Re-evaluation of wildcard transitions is triggered only by an event not matched by explicit event descriptors.
+
+::: warning
+
+It is possible to create infinite loops if eventless transitions are misused.
+Eventless transitions should be defined either with `target`, `cond` + `target`, `cond` + `actions`, or `cond` + `target` + `actions`. Target, if declared, should be different than the current state node. Eventless transitions with no `target` nor `cond` will cause an infinite loop. Transitions with `cond` and `actions` may run into an infinite loop if its `cond` guard keeps returning `true`.
+
+:::
+
+::: tip
+
+When eventless transitions are checked, their guards are evaluated repeatedly until all of them return false, or a transition with target is validated. Every time some guard evaluates to `true` during this process, its associated actions are going to be executed once. Thus it is possible that during a single microtask some transitions without targets are executed multiple times.
+This contrasts with common transitions, where always maximum one transition can be taken.
+
+:::
 
 ## Forbidden Transitions
 

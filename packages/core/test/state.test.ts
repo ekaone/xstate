@@ -142,8 +142,7 @@ describe('State', () => {
 
     it('normal state transitions with unknown event should be unchanged', () => {
       const twoState = machine.transition(machine.initialState, 'TO_TWO');
-      // @ts-ignore
-      const changedState = machine.transition(twoState, 'UNKNOWN_EVENT');
+      const changedState = machine.transition(twoState, 'UNKNOWN_EVENT' as any);
       expect(changedState.changed).toBe(false);
     });
 
@@ -318,6 +317,20 @@ describe('State', () => {
       expect(machine.transition(stateFromConfig, 'TO_TWO').value).toEqual({
         two: { deep: 'foo' }
       });
+    });
+
+    it('should preserve state.nextEvents using machine.resolveState', () => {
+      const { initialState } = machine;
+      const { nextEvents } = initialState;
+      const jsonInitialState = JSON.parse(JSON.stringify(initialState));
+
+      const stateFromConfig = State.create(jsonInitialState) as StateFrom<
+        typeof machine
+      >;
+
+      expect(machine.resolveState(stateFromConfig).nextEvents.sort()).toEqual(
+        nextEvents.sort()
+      );
     });
   });
 

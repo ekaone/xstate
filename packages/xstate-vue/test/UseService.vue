@@ -6,28 +6,22 @@
 </template>
 
 <script lang="ts">
+import { PropType, toRefs } from 'vue';
 import { useService } from '../src';
-import {
-  Machine,
-  assign,
-  Interpreter,
-  spawn,
-  doneInvoke,
-  State,
-  Service
-} from 'xstate';
-import { watch, ref } from '@vue/composition-api';
+import { Interpreter } from 'xstate';
+import { watchEffect } from 'vue';
 
 export default {
-  props: ['service'],
-  setup(props): { service: Service } {
-    let { state, send } = useService(props.service);
+  props: {
+    service: {
+      type: Object as PropType<Interpreter<any>>
+    }
+  },
+  setup(props) {
+    const { service } = toRefs(props);
+    let { state, send } = useService(service);
 
-    watch(() => {
-      let currentState = useService(props.service);
-      state.value = currentState.state.value;
-      send = currentState.send;
-    });
+
     return { state, send };
   }
 };

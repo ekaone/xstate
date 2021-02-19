@@ -109,11 +109,11 @@ const intervalMachine = Machine<{
           return () => clearInterval(ivl);
         }
       },
+      always: {
+        target: 'finished',
+        cond: (ctx) => ctx.count === 3
+      },
       on: {
-        '': {
-          target: 'finished',
-          cond: (ctx) => ctx.count === 3
-        },
         INC: { actions: assign({ count: (ctx) => ctx.count + 1 }) },
         SKIP: 'wait'
       }
@@ -157,13 +157,13 @@ describe('invoke', () => {
               id: 'someService',
               autoForward: true
             },
+            always: {
+              target: 'stop',
+              cond: (ctx) => ctx.count === 2
+            },
             on: {
               INC: {
                 actions: assign({ count: (ctx) => ctx.count + 1 })
-              },
-              '': {
-                target: 'stop',
-                cond: (ctx) => ctx.count === 2
               }
             }
           },
@@ -225,13 +225,13 @@ describe('invoke', () => {
               id: 'someService',
               autoForward: true
             },
+            always: {
+              target: 'stop',
+              cond: (ctx) => ctx.count === -3
+            },
             on: {
               DEC: { actions: assign({ count: (ctx) => ctx.count - 1 }) },
-              FORWARD_DEC: undefined,
-              '': {
-                target: 'stop',
-                cond: (ctx) => ctx.count === -3
-              }
+              FORWARD_DEC: undefined
             }
           },
           stop: {
@@ -952,6 +952,7 @@ describe('invoke', () => {
         }, 10);
       });
 
+      // tslint:disable-next-line:max-line-length
       it('should be invoked with a promise factory and stop on unhandled onError target when on strict mode', (done) => {
         const doneSpy = jest.fn();
 
@@ -1297,10 +1298,8 @@ describe('invoke', () => {
         },
         {
           services: {
-            someCallback: (ctx, e: BeginEvent) => (
-              cb: (ev: CallbackEvent) => void
-            ) => {
-              if (ctx.foo && e.payload) {
+            someCallback: (ctx, e) => (cb: (ev: CallbackEvent) => void) => {
+              if (ctx.foo && 'payload' in e) {
                 cb({
                   type: 'CALLBACK',
                   data: 40
@@ -1425,7 +1424,7 @@ describe('invoke', () => {
               on: { BEGIN: 'first' }
             },
             first: {
-              on: { '': 'second' }
+              always: 'second'
             },
             second: {
               invoke: {
@@ -1876,11 +1875,11 @@ describe('invoke', () => {
                   })
                 )
             },
+            always: {
+              target: 'counted',
+              cond: (ctx) => ctx.count === 5
+            },
             on: {
-              '': {
-                target: 'counted',
-                cond: (ctx) => ctx.count === 5
-              },
               COUNT: { actions: assign({ count: (_, e) => e.value }) }
             }
           },
@@ -2055,7 +2054,6 @@ describe('invoke', () => {
   });
 
   describe('multiple simultaneous services', () => {
-    // @ts-ignore
     const multiple = Machine<any>({
       id: 'machine',
       initial: 'one',
@@ -2195,9 +2193,7 @@ describe('invoke', () => {
                 serviceCalled = true;
               }
             },
-            on: {
-              '': 'inactive'
-            }
+            always: 'inactive'
           },
           inactive: {
             after: { 10: 'complete' }
@@ -2235,7 +2231,9 @@ describe('invoke', () => {
                   active: {
                     invoke: {
                       id: 'active',
-                      src: () => () => {}
+                      src: () => () => {
+                        /* ... */
+                      }
                     },
                     on: {
                       NEXT: {
@@ -2362,6 +2360,41 @@ describe('invoke', () => {
         .start();
     });
   });
+
+  it('invoke `src` should accept invoke source definition', (done) => {
+    const machine = createMachine(
+      {
+        initial: 'searching',
+        states: {
+          searching: {
+            invoke: {
+              src: {
+                type: 'search',
+                endpoint: 'example.com'
+              },
+              onDone: 'success'
+            }
+          },
+          success: {
+            type: 'final'
+          }
+        }
+      },
+      {
+        services: {
+          search: async (_, __, meta) => {
+            expect(meta.src.endpoint).toEqual('example.com');
+
+            return await 42;
+          }
+        }
+      }
+    );
+
+    interpret(machine)
+      .onDone(() => done())
+      .start();
+  });
 });
 
 describe('services option', () => {
@@ -2395,7 +2428,7 @@ describe('services option', () => {
 
             expect(data).toEqual({ newCount: 84, staticVal: 'hello' });
 
-            return new Promise((res) => {
+            return new Promise<void>((res) => {
               res();
             });
           }

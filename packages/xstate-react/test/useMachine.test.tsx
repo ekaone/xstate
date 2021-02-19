@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { useMachine, useService } from '../src';
+import { useMachine, useService, useActor } from '../src';
 import {
   Machine,
   assign,
@@ -7,16 +7,19 @@ import {
   spawn,
   doneInvoke,
   State,
-  createMachine
+  createMachine,
+  send
 } from 'xstate';
 import {
   render,
   fireEvent,
   cleanup,
-  waitForElement
+  waitForElement,
+  act
 } from '@testing-library/react';
 import { useState } from 'react';
 import { asEffect, asLayoutEffect } from '../src/useMachine';
+import { DoneEventObject } from 'xstate';
 
 afterEach(cleanup);
 
@@ -24,7 +27,10 @@ describe('useMachine hook', () => {
   const context = {
     data: undefined
   };
-  const fetchMachine = Machine<typeof context>({
+  const fetchMachine = Machine<
+    typeof context,
+    { type: 'FETCH' } | DoneEventObject
+  >({
     id: 'fetch',
     initial: 'idle',
     context,
@@ -188,7 +194,7 @@ describe('useMachine hook', () => {
       states: {
         start: {
           entry: assign({
-            ref: () => spawn(new Promise((res) => res(42)), 'my-promise')
+            ref: () => spawn(() => new Promise((res) => res(42)), 'my-promise')
           }),
           on: {
             [doneInvoke('my-promise')]: 'success'
@@ -219,7 +225,7 @@ describe('useMachine hook', () => {
   });
 
   it('actions should not have stale data', async (done) => {
-    const toggleMachine = Machine({
+    const toggleMachine = Machine<any, { type: 'TOGGLE' }>({
       initial: 'inactive',
       states: {
         inactive: {
@@ -343,7 +349,7 @@ describe('useMachine hook', () => {
   it('should capture all actions', (done) => {
     let count = 0;
 
-    const machine = createMachine({
+    const machine = createMachine<any, { type: 'EVENT' }>({
       initial: 'active',
       states: {
         active: {
@@ -497,5 +503,257 @@ describe('useMachine hook', () => {
       'string effect'
     ]);
     done();
+  });
+
+  it('initial effect actions should execute during the very first commit phase', (done) => {
+    let commitPhaseCounter = 0;
+
+    const machine = createMachine({
+      initial: 'active',
+      states: {
+        active: {
+          entry: [
+            asLayoutEffect(() => {
+              expect(commitPhaseCounter).toBe(1);
+            }),
+            asEffect(() => {
+              expect(commitPhaseCounter).toBe(1);
+            })
+          ]
+        }
+      }
+    });
+
+    const App = () => {
+      React.useLayoutEffect(() => {
+        commitPhaseCounter++;
+      });
+      useMachine(machine);
+
+      return <div />;
+    };
+
+    render(
+      <React.StrictMode>
+        <App />
+      </React.StrictMode>
+    );
+    done();
+  });
+});
+
+describe('useMachine (strict mode)', () => {
+  it('should not invoke initial services more than once', () => {
+    let activatedCount = 0;
+    const machine = createMachine({
+      initial: 'active',
+      invoke: {
+        src: () => {
+          activatedCount++;
+          return () => {};
+        }
+      },
+      states: {
+        active: {}
+      }
+    });
+
+    const Test = () => {
+      useMachine(machine);
+
+      return null;
+    };
+
+    render(
+      <React.StrictMode>
+        <Test />
+      </React.StrictMode>
+    );
+
+    expect(activatedCount).toEqual(1);
+  });
+
+  it('child component should be able to send an event to a parent immediately in an effect', (done) => {
+    const machine = createMachine<any, { type: 'FINISH' }>({
+      initial: 'active',
+      states: {
+        active: {
+          on: { FINISH: 'success' }
+        },
+        success: {}
+      }
+    });
+
+    const ChildTest: React.FC<{ send: any }> = ({ send }) => {
+      // This will send an event to the parent service
+      // BEFORE the service is ready.
+      React.useLayoutEffect(() => {
+        send({ type: 'FINISH' });
+      }, []);
+
+      return null;
+    };
+
+    const Test = () => {
+      const [state, send] = useMachine(machine);
+
+      if (state.matches('success')) {
+        done();
+      }
+
+      return <ChildTest send={send} />;
+    };
+
+    render(
+      <React.StrictMode>
+        <Test />
+      </React.StrictMode>
+    );
+  });
+
+  it('custom data should be available right away for the invoked actor', (done) => {
+    const childMachine = Machine({
+      initial: 'intitial',
+      context: {
+        value: 100
+      },
+      states: {
+        intitial: {}
+      }
+    });
+
+    const machine = Machine({
+      initial: 'active',
+      states: {
+        active: {
+          invoke: {
+            id: 'test',
+            src: childMachine,
+            data: {
+              value: () => 42
+            }
+          }
+        }
+      }
+    });
+
+    const Test = () => {
+      const [state] = useMachine(machine);
+      const [childState] = useActor(state.children.test);
+
+      expect(childState.context.value).toBe(42);
+
+      return null;
+    };
+
+    render(
+      <React.StrictMode>
+        <Test />
+      </React.StrictMode>
+    );
+    done();
+  });
+
+  // https://github.com/davidkpiano/xstate/issues/1334
+  it('delayed transitions should work when initializing from a rehydrated state', () => {
+    jest.useFakeTimers();
+    try {
+      const testMachine = Machine<any, { type: 'START' }>({
+        id: 'app',
+        initial: 'idle',
+        states: {
+          idle: {
+            on: {
+              START: 'doingStuff'
+            }
+          },
+          doingStuff: {
+            id: 'doingStuff',
+            after: {
+              100: 'idle'
+            }
+          }
+        }
+      });
+
+      const persistedState = JSON.stringify(testMachine.initialState);
+
+      let currentState;
+
+      const Test = () => {
+        const [state, send] = useMachine(testMachine, {
+          state: State.create(JSON.parse(persistedState))
+        });
+
+        currentState = state;
+
+        return (
+          <button onClick={() => send('START')} data-testid="button"></button>
+        );
+      };
+
+      const { getByTestId } = render(
+        <React.StrictMode>
+          <Test />
+        </React.StrictMode>
+      );
+
+      const button = getByTestId('button');
+
+      fireEvent.click(button);
+      act(() => {
+        jest.advanceTimersByTime(110);
+      });
+
+      expect(currentState.matches('idle')).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should accept a lazily created machine', () => {
+    const App = () => {
+      const [state] = useMachine(() =>
+        createMachine({
+          initial: 'idle',
+          states: {
+            idle: {}
+          }
+        })
+      );
+
+      expect(state.matches('idle')).toBeTruthy();
+
+      return null;
+    };
+
+    render(<App />);
+  });
+
+  it('should not miss initial synchronous updates', () => {
+    const m = createMachine<any>({
+      initial: 'idle',
+      context: {
+        count: 0
+      },
+      entry: [assign({ count: 1 }), send('INC')],
+      on: {
+        INC: {
+          actions: [assign({ count: (ctx) => ++ctx.count }), send('UNHANDLED')]
+        }
+      },
+      states: {
+        idle: {}
+      }
+    });
+
+    const App = () => {
+      const [state] = useMachine(m);
+      return state.context.count;
+    };
+
+    const { container } = render(<App />);
+
+    expect(container.textContent).toBe('2');
   });
 });

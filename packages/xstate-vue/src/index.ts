@@ -1,11 +1,4 @@
-import {
-  ref,
-  watch,
-  isRef,
-  onMounted,
-  onBeforeUnmount,
-  Ref
-} from '@vue/composition-api';
+import { shallowRef, watch, isRef, onMounted, onBeforeUnmount, Ref } from 'vue';
 import {
   interpret,
   EventObject,
@@ -14,7 +7,8 @@ import {
   Interpreter,
   InterpreterOptions,
   MachineOptions,
-  StateConfig
+  StateConfig,
+  Typestate
 } from 'xstate';
 
 interface UseMachineOptions<TContext, TEvent extends EventObject> {
@@ -29,15 +23,19 @@ interface UseMachineOptions<TContext, TEvent extends EventObject> {
   state?: StateConfig<TContext, TEvent>;
 }
 
-export function useMachine<TContext, TEvent extends EventObject>(
-  machine: StateMachine<TContext, any, TEvent>,
+export function useMachine<
+  TContext,
+  TEvent extends EventObject,
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
+>(
+  machine: StateMachine<TContext, any, TEvent, TTypestate>,
   options: Partial<InterpreterOptions> &
     Partial<UseMachineOptions<TContext, TEvent>> &
     Partial<MachineOptions<TContext, TEvent>> = {}
 ): {
-  state: Ref<State<TContext, TEvent>>;
-  send: Interpreter<TContext, any, TEvent>['send'];
-  service: Interpreter<TContext, any, TEvent>;
+  state: Ref<State<TContext, TEvent, any, TTypestate>>;
+  send: Interpreter<TContext, any, TEvent, TTypestate>['send'];
+  service: Interpreter<TContext, any, TEvent, TTypestate>;
 } {
   const {
     context,
@@ -65,10 +63,17 @@ export function useMachine<TContext, TEvent extends EventObject>(
   } as TContext);
 
   const service = interpret(createdMachine, interpreterOptions).start(
-    rehydratedState ? State.create(rehydratedState) : undefined
+    rehydratedState
+      ? (State.create(rehydratedState) as State<
+          TContext,
+          TEvent,
+          any,
+          TTypestate
+        >)
+      : undefined
   );
 
-  const state = ref<State<TContext, TEvent>>(service.state);
+  const state = shallowRef(service.state);
 
   onMounted(() => {
     service.onTransition((currentState) => {
@@ -87,29 +92,37 @@ export function useMachine<TContext, TEvent extends EventObject>(
   return { state, send: service.send, service };
 }
 
-export function useService<TContext, TEvent extends EventObject>(
+export function useService<
+  TContext,
+  TEvent extends EventObject,
+  TTypestate extends Typestate<TContext> = { value: any; context: TContext }
+>(
   service:
-    | Interpreter<TContext, any, TEvent>
-    | Ref<Interpreter<TContext, any, TEvent>>
+    | Interpreter<TContext, any, TEvent, TTypestate>
+    | Ref<Interpreter<TContext, any, TEvent, TTypestate>>
 ): {
-  state: Ref<State<TContext, TEvent>>;
-  send: Interpreter<TContext, any, TEvent>['send'];
-  service: Ref<Interpreter<TContext, any, TEvent>>;
+  state: Ref<State<TContext, TEvent, any, TTypestate>>;
+  send: Interpreter<TContext, any, TEvent, TTypestate>['send'];
+  service: Ref<Interpreter<TContext, any, TEvent, TTypestate>>;
 } {
-  const serviceRef = isRef(service)
-    ? service
-    : ref<Interpreter<TContext, any, TEvent>>(service);
-  const state = ref<State<TContext, TEvent>>(serviceRef.value.state);
+  const serviceRef = isRef(service) ? service : shallowRef(service);
+  const state = shallowRef(serviceRef.value.state);
 
-  watch(serviceRef, (service, _, onCleanup) => {
-    state.value = service.state;
-    const { unsubscribe } = service.subscribe((currentState) => {
-      if (currentState.changed) {
-        state.value = currentState;
-      }
-    });
-    onCleanup(() => unsubscribe());
-  });
+  watch(
+    serviceRef,
+    (service, _, onCleanup) => {
+      state.value = service.state;
+      const { unsubscribe } = service.subscribe((currentState) => {
+        if (currentState.changed) {
+          state.value = currentState;
+        }
+      });
+      onCleanup(() => unsubscribe());
+    },
+    {
+      immediate: true
+    }
+  );
 
   const send = (event: TEvent | TEvent['type']) => serviceRef.value.send(event);
 
